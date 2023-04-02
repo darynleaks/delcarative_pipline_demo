@@ -1,0 +1,106 @@
+pipeline {
+    agent {
+        node { label "" } #
+    }
+
+    environment {
+        PACKAGE_VERSION = ''
+        REGISTRY = ''
+        NAMESPACE = ''
+        CLUSTER_URI = 'https://api.ocp-t.sberbank.kz:6443'
+    }
+
+    stages {
+        stage('Clear workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Get sources.') {
+            steps {
+                script {
+                    checkout scm
+                }
+            }
+        }
+
+        stage('Set environment variables (version, registry).') {
+            steps {
+                script {
+                    def package_json = readJSON file: "./folder/${SERVICE_NAME}/package.json"
+                    def values_yaml = readYaml file: "./folder/${${SERVICE_NAME}}/helm/values-test.yaml" // TODO: values.yaml
+
+                    PACKAGE_VERSION = package_json['version']
+                    echo "PACKAGE_VERSION: ${PACKAGE_VERSION}"
+
+                    REGISTRY = values_yaml['image']['registry']
+                    echo "REGISTRY: ${REGISTRY}"
+
+                    NAMESPACE = values_yaml['namespace']
+                    echo "NAMESPACE: ${NAMESPACE}"
+
+                    if (REGISTRY == '') {
+                        currentBuild.result = 'ABORTED'
+                        error('REGISTRY missing.')
+                    }
+
+                    if (PACKAGE_VERSION == '') {
+                        currentBuild.result = 'ABORTED'
+                        error('PACKAGE_VERSION missing.')
+                    }
+
+                    if (NAMESPACE == '') {
+                        currentBuild.result = 'ABORTED'
+                        error('NAMESPACE missing.')
+                    }
+                }
+            }
+        }
+
+        stage('Docker build.') {
+            steps {
+                script {
+                    docker.withRegistry("https://${REGISTRY}", "Jenkins-to-Nexus") {
+                        def image = docker.build("${REGISTRY}/${NAMESPACE}/${SERVICE_NAME}:${PACKAGE_VERSION}",
+                                                 "-f folder/${SERVICE_NAME}}/Dockerfile . --build-arg branch=${env.GIT_BRANCH}")
+                        image.push()
+                    }
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo 'Testing..'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+		    def helm_home = tool name: 'helm-v3.3.4', type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool'
+		    def helm = "${helm_home}/helm"
+		    def oc_home = tool name: "oc3.11.0", type: 'oc'
+		    def oc = "${oc_home}/oc"
+
+                    withCredentials([string(credentialsId: 'haos-openshift-test-token', variable: 'TOKEN')]) {
+                        try {
+                            sh "$oc login ${CLUSTER_URI} --insecure-skip-tls-verify --token=${TOKEN}"
+                        } catch (e) {
+                            error "Error while oc login: $e"
+                        }
+                    }
+                    dir("apps/nefico/${NEFICO_SERVICE}/") {
+                        try {
+                            sh "${oc} project ${NAMESPACE}"
+                            sh "${helm} upgrade --install ${NEFICO_SERVICE} --set=image.tag=${PACKAGE_VERSION} --values=helm/values-test.yaml helm/"
+                        } catch (e) {
+                            error "Error while helm upgrade: $e"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

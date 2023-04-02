@@ -1,0 +1,511 @@
+#!groovy
+import org.apache.tools.ant.types.resources.selectors.Date
+import org.yaml.snakeyaml.Yaml
+
+@Library("dev_library@master") _
+
+job_props = [:] //Массив параметров Job.
+runtime_props = [:] //Массив парамеров исполнения Pipeline
+
+// variables declaration
+def BitbucketRepositories = []
+def Apps = []
+def ErrorLog = ""
+def Log = new StringBuilder()
+def HelmChartDIr = ""
+def LogVars = [:]
+
+pipeline {
+    agent {
+        node { label "MSA-slave" }
+    } // agent
+
+    options {
+        skipStagesAfterUnstable()
+        ansiColor('xterm')
+    } // options
+
+    environment {
+        HELM_TOOL = tool name: 'helm-v3.3.4', type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool'
+        helm = "${HELM_TOOL}/helm"
+        oc_tool = tool name: "oc3.11.0", type: 'oc'
+        oc = "${oc_tool}/oc"
+        GOPROXY="https://nexus.sberbank.kz/repository/golang/"
+        GONOPROXY="*.sberbank.kz"
+    } // enviroment
+
+    stages {
+        stage("Stage 1. Подготовка и проверка параметров pipeline") {
+            steps {
+                script {
+                    dev_common.SavePrintLog("Stage 1", "Подготовка и проверка параметров pipeline", Log, "violet")
+
+                    if (BitbucketProject) {
+                        job_props.BitbucketProject = BitbucketProject
+                    }
+
+                    if ("${params.BitbucketRepositories}") {
+                        BitbucketRepositories = "${params.BitbucketRepositories}"
+                        LogVars.pipelineRunMethod = "Ручной"
+                        BitbucketRepository = ""
+                        job_props.Apps = BitbucketRepositories.trim().split(",")
+                    }
+
+                    if (BitbucketRepository != "") {
+                        BitbucketRepositories.add(BitbucketRepository)
+                        job_props.Apps = BitbucketRepositories
+                        LogVars.pipelineRunMethod = "Триггер из репозитория Bitbucket"
+                    } // if
+
+                    if (GitBranch) {
+                        CleanBranchName = GitBranch - ~/^([A-Za-z]*\/){2}/
+                        GitBranch = CleanBranchName
+                        job_props.GitBranch = GitBranch
+                        job_props.HelmValuesFileEnviroment = GitBranch
+                    } // if GitBranch else
+
+                    if ((env.propertiesID != null) && (env.propertiesID.trim() != "")) {
+                        configFileProvider([configFile(fileId: "${env.propertiesID}", targetLocation: 'config.properties')]) {
+                            dev_common.readConfig(job_props, "config.properties")
+                        } // configFileProvider
+                    } // if env.propertiesID
+
+                    if (job_props.GitBranch == "dev" && job_props.OpenshiftDevClusterApiUrl == null) {
+                        dev_common.SavePrintLog("Error", "В конфигурационном файле нет параметра OpenshiftDevClusterApiUrl", Log, "red")
+                        error "В конфигурационном файле нет параметра OpenshiftDevClusterApiUrl"
+                    } else if (job_props.GitBranch == "test" && job_props.OpenshiftTestClusterApiUrl == null) {
+                        dev_common.SavePrintLog("Error", "В конфигурационном файле нет параметра OpenshiftTestClusterApiUrl", Log, "red")
+                        error "В конфигурационном файле нет параметра OpenshiftTestClusterApiUrl"
+                    } // else if GitBranch
+
+                    if (job_props.GitBranch == "dev" && job_props.OpenshiftDevToken == null) {
+                        dev_common.SavePrintLog("Error", "В конфигурационном файле нет параметра OpenshiftDevToken", Log, "red")
+                        error "В конфигурационном файле нет параметра OpenshiftDevToken"
+                    } else if (job_props.GitBranch == "test" && job_props.OpenshiftTestToken == null) {
+                        dev_common.SavePrintLog("Error", "В конфигурационном файле нет параметра OpenshiftTestToken", Log, "red")
+                        error "В конфигурационном файле нет параметра OpenshiftTestToken"
+                    } // else if GitBranch
+
+                    if (job_props.GitBranch == "test" && job_props.JenkinsTestSlave == null) {
+                        dev_common.SavePrintLog("Error", "В конфигурационном файле нет параметра JenkinsTestSlave", Log, "red")
+                        error "В конфигурационном файле нет параметра JenkinsTestSlave"
+                    } else if (job_props.GitBranch == "dev" && job_props.JenkinsDevSlave == null) {
+                        dev_common.SavePrintLog("Error", "В конфигурационном файле нет параметра JenkinsDevSlave", Log, "red")
+                        error "В конфигурационном файле нет параметра JenkinsDevSlave"
+                    }
+
+                    if (job_props.GitBranch == "dev") {
+                        job_props.OpenshiftToken = job_props.OpenshiftDevToken
+                        job_props.OpenshiftClusterApiUrl = job_props.OpenshiftDevClusterApiUrl
+                        job_props.JenkinsSlave = job_props.JenkinsDevSlave
+                    }
+
+                    if (job_props.GitBranch == "test") {
+                        job_props.OpenshiftToken = job_props.OpenshiftTestToken
+                        job_props.OpenshiftClusterApiUrl = job_props.OpenshiftTestClusterApiUrl
+                        job_props.JenkinsSlave = job_props.JenkinsTestSlave
+                    }
+
+                    if (job_props.BitBucketCredentialsId == null) {
+                        dev_common.SavePrintLog("Error", "В конфигурационном файле нет параметра BitBucketCredentialsId", Log, "red")
+                        error "В конфигурационном файле нет параметра BitBucketCredentialsId"
+                    } // if BitBucketCredentialsId
+
+                    if (job_props.NexusCredentialsId == null) {
+                        dev_common.SavePrintLog("Error", "В конфигурационном файле нет парамера NexusCredentialsId", "red")
+                        error "В конфигурационном файле нет параметра NexusCredentialsId"
+                    }
+                }// script
+            } // steps
+        } // stage 1
+
+        stage("Stage 2: Распечатка параметров pipeline") {
+            steps {
+                script {
+                    dev_common.SavePrintLog("Stage 2", "Распечатка параметров pipeline", Log, "violet")
+                    dev_common.SavePrintLog("Способ запуска Pipeline", LogVars.pipelineRunMethod, Log, "green")
+                    dev_common.SavePrintLog("Проект в Bitbucket", job_props.BitbucketProject, Log, "green")
+                    dev_common.SavePrintLog("Список репозиториев Bitbucket", job_props.Apps, Log, "green")
+                    dev_common.SavePrintLog("Название ветки Git", job_props.GitBranch, Log, "green")
+                    dev_common.SavePrintLog("Url Openshift кластера", job_props.OpenshiftClusterApiUrl, Log, "green")
+                    dev_common.SavePrintLog("Jenkins Slave", job_props.JenkinsSlave, Log, "green")
+                } // script
+            } // steps
+        }  // stage 2
+
+        stage("Stage 3: Очистка workspace") {
+            steps {
+                script {
+                    dev_common.SavePrintLog("Stage 3", "Очистка workspace", Log, "violet")
+                    cleanWs()
+                } // script
+            } // steps
+        } // stage 3
+
+        stage("Stage 4: Скачивание исходного кода приложения") {
+            steps {
+                script {
+                    dev_common.SavePrintLog("Stage 4", "Скачивание исходного кода приложения", Log, "violet")
+                    sh("git config --global http.sslVerify false")
+                    for (app in job_props.Apps) {
+                        dev_common.downloadSourceCode(job_props.BitbucketProject, app, GitBranch, job_props.BitBucketCredentialsId, Log)
+                    } // for app
+                }  // script
+            } // steps
+        } // stage 4
+
+        stage("Stage 5: Подготовка и проверка параметров приложения") {
+            steps {
+                script {
+                    dev_common.SavePrintLog("Stage 5", "Подготовка и проверка параметров приложения", Log, "violet")
+
+                    for (app in job_props.Apps) {
+                        // Проверка на существование папки helm
+                        dir(app) {
+                            dockerFileExists = fileExists("Dockerfile")
+                            if (dockerFileExists) {
+                                dev_common.SavePrintLog("Проверка на существование файла [Dockerfile]", "Успешно", Log, "green")
+                            } else {
+                                dev_common.SavePrintLog("Проверка на существование файла [Dockerfile]", "Не успешно", Log, "red")
+                            }
+
+                            dir(job_props.HelmChartDIr) {
+                                // Проверка на существование записи maintainers в Chart.yaml
+                                ChartFile = "Chart.yaml"
+                                helmDIrExists = fileExists(ChartFile)
+                                if (helmDIrExists) {
+                                    dev_common.SavePrintLog("Проверка на существование папки [$job_props.HelmChartDIr]", "Успешно", Log, "green")
+                                } else {
+                                    dev_common.SavePrintLog("Проверка на существование папки [$job_props.HelmChartDIr]", "Не успешно", Log, "red")
+                                    error "Проверка на существование папки [$job_props.HelmChartDIr] : Не Успешно."
+                                } // else
+
+                                ChartFileValues = readYaml file: ChartFile
+                                def Mainteriners = ChartFileValues.maintainers
+                                if (Mainteriners != null) {
+                                    for (maintainer in Mainteriners) {
+                                        MailRecipients += "\n"
+                                        dev_common.SavePrintLog("Проверка на существование записи [maintainer] в файле [Chart.yaml]", "Успешно", Log, "green")
+                                        maintainerEmail = maintainer.get("email")
+                                        maintainerName = maintainer.get("name")
+                                        if (maintainerEmail != null && maintainerName != null) {
+                                            dev_common.SavePrintLog("Maintainer приложения", "Имя: $maintainerName, почта: $maintainerEmail", Log, "green")
+                                            MailRecipients += maintainerEmail
+                                        } else {
+                                            dev_common.SavePrintLog("Проверка на корректность записи [maintainer] в файле [Chart.yaml]", "Не успешно", Log, "green")
+                                            error "Проверка на корректность maintainer записи в Chart.yaml : Не успешно"
+                                        } // else
+                                    } // for maintainer
+                                } else {
+                                    dev_common.SavePrintLog("Проверка на существование maintainer записи в Chart.yaml", "Не успешно", Log, "red")
+                                    error "Проверка на существование записи [maintainer] в файле [Chart.yaml] : Не успешно"
+                                } // else Mainteriners == null
+
+                                // Проверка на существование файла values
+                                valuesFileName = "values-" + GitBranch + ".yaml"
+                                valuesFileExists = fileExists(valuesFileName)
+                                if (valuesFileExists) {
+                                    dev_common.SavePrintLog("Проверка на существование helm chart values файла [$valuesFileName]", "Успешно", Log, "green")
+                                } else {
+                                    dev_common.SavePrintLog("Проверка на существование helm chart values файла [$valuesFileName]", "Не успешно", Log, "red")
+                                    error "Проверка на существование helm chart values файла [$valuesFileName]: Не успешно"
+                                } // else
+
+                                // Проверка на существование записи namespace в values файле
+                                ValuesFileRecords = readYaml file: valuesFileName
+                                def OpenshiftProject = ValuesFileRecords.namespace
+                                if (OpenshiftProject != null) {
+                                    dev_common.SavePrintLog("Проверка на существование записи [namespace] в  values файле [$valuesFileName]", "Успешно", Log, "green")
+                                    dev_common.SavePrintLog("Проект в Openshift", OpenshiftProject, Log, "green")
+                                } else {
+                                    dev_common.SavePrintLog("Проверка на существование записи [namespace] в  values файле [$valuesFileName]", "Не успешно", Log, "red")
+                                } // else Openshift project
+
+                            } // dir helm
+                            // Проверка на существование нужного values файла
+                            // НУЖНО ДОБАВИТЬ ПРОВЕРКУ на КОРРЕКТНОСТЬ DOCKER IMAGE В VALUES FILE
+                        } // dir app
+
+                    } // for app in job_props Apps
+
+                }
+            } // steps
+        } // stage 5
+		stage('Stage 6: SonarQube: статический анализ') {
+          steps {
+              script {
+              	  sh("export NODE_HOME=/usr/local/lib/nodejs/node-v18.14.0-linux-x64/ && export PATH=$NODE_HOME/bin:$PATH")
+                  def scannerHome = tool 'SonarQube-Scanner'
+                  for (app in job_props.Apps) {
+                        dir(app) {
+                          withCredentials([usernamePassword(credentialsId: 'jenkins_sonar', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                              withSonarQubeEnv('SonarQube-SberKZ') {
+                                    //sh "export SONAR_SCANNER_OPTS=\"-Djavax.net.ssl.trustStore=/path/to/sonar.keystore -Djavax.net.ssl.trustStorePassword=changeit\""
+                                  sh "${scannerHome}/sonar-scanner -DworkSpace=${WORKSPACE} " +
+                                  "-Dsonar.projectKey=${app} " +
+                                  "-Dsonar.projectName=${app} " +
+                                  "-Dsonar.branch.name=${GitBranch}"
+                                  "-Dsonar.dynamicAnalysis=reuseReports " +
+                                  "-Dsonar.sources=${WORKSPACE} " +
+                                  "-Dsonar.java.binaries=${WORKSPACE} " +
+                                  "-Dsonar.sourceEncoding=UTF-8 " +
+                                  "-Dsonar.login=$USERNAME " +
+                                  "-Dsonar.password=$PASSWORD"
+                                  echo "sonar stat analysis"
+                                } // withSonarQubeEnv
+                            } // withCredentials
+                            timeout(time: 10, unit: 'MINUTES') {
+                                def qg = waitForQualityGate()
+                                if (qg.status != 'OK') {
+                                    echo "SONAR FAILED"
+                                    //error("SONARQUBE - Static analysis completed with an error")
+                                }
+                                else {
+                                    echo "SONAR SUCCESS"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage("Stage 7: Запуск юнит-тестов"){
+            steps {
+                script {
+                	catchError(buildResult: 'SUCCESS', message: '"Unit test failed', stageResult: 'UNSTABLE') {
+                    	for (app in job_props.Apps) {
+                        	dir(app) {
+                            	sh('go mod tidy')
+                                sh('go test -v ./...')
+                            }
+                        }
+                	}
+            	}
+          	}
+        }
+        stage("Stage 8: Сборка и отправка Docker image") {
+            steps {
+                script {
+                    dev_common.SavePrintLog("Stage 6", "Сборка и отправка Docker image", Log, "violet")
+                    for (app in job_props.Apps) {
+                        dir(app) {
+                            dir(job_props.HelmChartDIr) {
+                                valuesFileName = "values-" + GitBranch + ".yaml"
+                                valuesFileRecords = readYaml file: valuesFileName
+                            }
+                            dockerRegistry = valuesFileRecords.image.registry
+                            dockerImageName = valuesFileRecords.namespace + '/' + valuesFileRecords.repo
+                            dockerRegistry = "https://" + valuesFileRecords.image.registry
+                            dockerImageTag = "$job_props.GitBranch" + "${(env.BUILD_ID)}"
+                            dev_common.SavePrintLog("Docker image", "$dockerImageName:$dockerImageTag", Log, "green")
+                            try {
+                                dev_common.SavePrintLog("Сборка Docker image", "Начата сборка Docker image: $dockerImageName:$dockerImageTag", Log, "green")
+                                dockerImage = docker.build(dockerImageName + ":" + dockerImageTag, " .")
+                                dev_common.SavePrintLog("Сборка Docker image", "Успешно завершилась сборка Docker image: $dockerImageName:$dockerImageTag", Log, "green")
+                            } catch (e) {
+                                dev_common.SavePrintLog("Сборка Docker image", "Не успешно завершилась сборка Docker image: $dockerImageName:$dockerImageTag. Ошибка: $e", Log, "red")
+                                error "Не успешно завершилась сборка Docker image: $dockerImageName:$dockerImageTag. Ошибка: $e"
+                            }
+
+                            try {
+                                dev_common.SavePrintLog("Отправка Docker image", "Начата отправка Docker image: $dockerImageName:$dockerImageTag в Docker registry: $dockerRegistry", Log, "green")
+                                docker.withRegistry(dockerRegistry, job_props.NexusCredentialsId) {
+                                    dockerImage.push(dockerImageTag)
+                                } // docker with Registry
+                                dev_common.SavePrintLog("Отправка Docker image", "Успешно завершилась отправка Docker image: $dockerImageName:$dockerImageTag в Docker registry: $dockerRegistry", Log, "green")
+                                sh("docker rmi ${dockerImageName}:${dockerImageTag}")
+
+                            } catch (e) {
+                                dev_common.SavePrintLog("Отправка Docker image", "Не успешно завершилась отправка Docker image: $dockerImageName:$dockerImageTag в Docker registry: $dockerRegistry Ошибка: $e", Log, "red")
+                                error "Не успешно завершилась отправка Docker image: $dockerImageName:$dockerImageTag в Docker registry: $dockerRegistry Ошибка: $e"
+                            }
+
+                        }
+                    } // for app in Apps
+                } // script
+            } // steps
+        } // stage Build Docker image
+
+
+        stage("CD stages") {
+            steps {
+                script {
+                    node(job_props.JenkinsSlave) {
+                        stage("Clean workspaces in jenkins slave") {
+                            script {
+                                dev_common.SavePrintLog("CD Stages ", "1. Очистка workspace", Log, "violet")
+                                cleanWs()
+                            } // script
+                        } // stage Clean workspaces in Prod jenkins slave
+
+                        stage("Download helm chart stage") {
+                            script {
+                                dev_common.SavePrintLog("CD Stages", "2. Download helm chart stage", Log, "green")
+                                for (app in job_props.Apps) {
+                                    dev_common.downloadSourceCode(job_props.BitbucketProject, app, GitBranch, job_props.BitBucketCredentialsId, Log)
+                                } // for app
+                            } // script
+                        } // stage Download helm chart stage
+
+                        stage("Проверка синтаксиса Helm chart") {
+                            script {
+                                dev_common.SavePrintLog("CD Stages", "3. Проверка синтаксиса Helm chart", Log, "violet")
+                                for (app in job_props.Apps) {
+                                    dir(app) {
+                                        dir(job_props.HelmChartDIr) {
+                                            valuesFileName = "values-" + GitBranch + ".yaml"
+                                            valuesFileRecords = readYaml file: valuesFileName
+
+                                            String hLint = sh returnStdout: true, script: "$helm lint $HelmChartDIr -f $valuesFileName"
+
+                                            if (hLint.contains('0 chart(s) failed')) {
+                                                dev_common.SavePrintLog("Проверка синтаксиса helm chart приложения $app", "Успешно", Log, "green")
+                                            } else {
+                                                dev_common.SavePrintLog("Проверка синтаксиса helm chart приложения $app", "Неуспешно", Log, "red")
+                                                error "Проверка синтаксиса helm chart приложения $app : Неуспешно"
+                                            } // else
+                                        } // dir helm
+                                    } // dir app
+                                } // for app in Apps
+                            } // script
+                        } // stage Helm lint stage
+
+                        stage("Helm dry-run install") {
+                            script {
+                                dev_common.SavePrintLog("CD Stages", "4. Helm dry-run install", Log, "violet")
+                                withCredentials([string(credentialsId: job_props.OpenshiftToken, variable: 'TOKEN')]) {
+                                    try {
+                                    	println job_props.OpenshiftToken
+                                        dev_common.SavePrintLog("Аутентификация в Openshift Cluster $job_props.OpenshiftClusterApiUrl", "Начало", Log, "green")
+                                        sh "$oc login $job_props.OpenshiftClusterApiUrl --insecure-skip-tls-verify --token=$TOKEN"
+                                        dev_common.SavePrintLog("Аутентификация в Openshift Cluster $job_props.OpenshiftClusterApiUrl", "Успешно", Log, "green")
+                                    } catch (e) {
+                                        dev_common.SavePrintLog("Аутентификация в Openshift Cluster $job_props.OpenshiftClusterApiUrl", "Неуспешно. Ошибка: $e", Log, "red")
+                                        error "Аутентификация в Openshift Cluster $job_props.OpenshiftClusterApiUrl: Неуспешно. Ошибка: $e"
+                                    } // catch
+                                } // with Credentials
+                                for (app in job_props.Apps) {
+                                    dir(app) {
+                                        dir(job_props.HelmChartDIr) {
+                                            dockerImageTag = "$job_props.GitBranch" + "${(env.BUILD_ID)}"
+
+                                            ChartFile = "Chart.yaml"
+                                            ChartFileValues = readYaml file: ChartFile
+                                            HelmReleaseName = ChartFileValues.name
+
+                                            valuesFileName = "values-" + GitBranch + ".yaml"
+                                            ValuesFileRecords = readYaml file: valuesFileName
+                                            OpenshiftProject = ValuesFileRecords.namespace
+
+                                        } // dir helm
+
+                                        try {
+                                            dev_common.SavePrintLog("Helm dry-run install  $HelmReleaseName --set image.tag=$dockerImageTag -n $OpenshiftProject", "Начало", Log, "green")
+                                            sh "$helm upgrade --dry-run --debug --install $HelmReleaseName $job_props.HelmChartDIr --set image.tag=$dockerImageTag -f $job_props.HelmChartDIr/$valuesFileName -n $OpenshiftProject"
+                                            dev_common.SavePrintLog("Helm dry-run install  $HelmReleaseName  --set image.tag=$dockerImageTag -f $valuesFileName -n $OpenshiftProject", "Успешно", Log, "green")
+                                        } catch (e) {
+                                            dev_common.SavePrintLog("Helm dry-run install  $HelmReleaseName --set image.tag=$dockerImageTag-n $OpenshiftProject", "Неуспешно. Ошибка: $e", Log, "red")
+                                            error "Helm dry-run install  $HelmReleaseName  --set image.tag=$dockerImageTag-n $OpenshiftProject: Неуспешно. Ошибка: $e"
+                                        }
+
+                                    } // dir app
+                                } // for app in Apps
+                            } // script
+                        } // stage Helm dry-run install
+
+                        stage("Stage : Установка Helm chart") {
+                                script {
+                                    dev_common.SavePrintLog("CD Stages", "5. Установка Helm chart", Log, "violet")
+
+                                    for (app in job_props.Apps) {
+                                        dir(app) {
+                                            dir(job_props.HelmChartDIr) {
+                                                dockerImageTag = "$job_props.GitBranch" + "${(env.BUILD_ID)}"
+
+                                                ChartFile = "Chart.yaml"
+                                                ChartFileValues = readYaml file: ChartFile
+                                                HelmReleaseName = ChartFileValues.name
+
+                                                valuesFileName = "values-" + GitBranch + ".yaml"
+                                                ValuesFileRecords = readYaml file: valuesFileName
+                                                OpenshiftProject = ValuesFileRecords.namespace
+                                            } // dir helm
+
+                                            try {
+                                                dev_common.SavePrintLog("Helm install $HelmReleaseName --set image.tag=$dockerImageTag -n $OpenshiftProject", "Начало", Log, "green")
+                                                sh "$helm upgrade --install $HelmReleaseName $job_props.HelmChartDIr --set image.tag=$dockerImageTag -f $job_props.HelmChartDIr/$valuesFileName -n $OpenshiftProject"
+                                                dev_common.SavePrintLog("Helm install $HelmReleaseName  --set image.tag=$dockerImageTag -f $valuesFileName -n $OpenshiftProject", "Успешно", Log, "green")
+                                            } catch (e) {
+                                                dev_common.SavePrintLog("Helm install $HelmReleaseName --set image.tag=$dockerImageTag-n $OpenshiftProject", "Неуспешно. Ошибка: $e", Log, "red")
+                                                error "Helm install  $HelmReleaseName  --set image.tag=$dockerImageTag-n $OpenshiftProject: Неуспешно. Ошибка: $e"
+                                            }
+
+                                        } // dir app
+                                    } // for app in Apps
+                                } // script
+                            } // stage Helm dry-run install
+
+
+                            stage("Stage Проверка подов") {
+                                    script {
+                                        dev_common.SavePrintLog("CD Stages", "6. Проверка подов", Log, "violet")
+                                        for (app in job_props.Apps) {
+                                            dir(app) {
+                                                dev_common.SavePrintLog("Ожидание", "30 секунд", Log, "green")
+                                                sleep 30
+
+                                                dir(job_props.HelmChartDIr) {
+                                                    dockerImageTag = "$job_props.GitBranch" + "${(env.BUILD_ID)}"
+
+                                                    ChartFile = "Chart.yaml"
+                                                    ChartFileValues = readYaml file: ChartFile
+                                                    HelmReleaseName = ChartFileValues.name
+
+                                                    valuesFileName = "values-" + GitBranch + ".yaml"
+                                                    ValuesFileRecords = readYaml file: valuesFileName
+                                                    OpenshiftProject = ValuesFileRecords.namespace
+                                                } // dir helm
+
+                                                podLabel = "app.kubernetes.io/name=$HelmReleaseName"
+
+                                                String PodStatus = sh returnStdout: true, script: "$oc get pods -l $podLabel -n $OpenshiftProject -o wide"
+
+                                                dev_common.SavePrintLog("Состояние подов: \n", "$PodStatus", Log, "violet")
+
+                                                Log += PodStatus
+                                                if (PodStatus.contains("NotReady") || PodStatus.contains("CrashLoopBackOff") || PodStatus.contains("Err") || PodStatus.contains("Invalid")) {
+                                                    dev_common.SavePrintLog("Состояние подов $HelmReleaseName", "Ошибочное", Log, "red")
+                                                    error "Состояние подов $HelmReleaseName: Ошибочное"
+                                                } else {
+                                                    dev_common.SavePrintLog("Состояние подов $HelmReleaseName", "Рабочее", Log, "green")
+                                                }
+                                            } // dir app
+                                        } // for app in Apps
+                                    } // script
+                                } // stage Проверка подов
+
+                            } // node Jenkins slave
+
+                        } // script
+                    } // steps
+                } // stage CD stages
+            } // stages
+
+            post {
+                always {
+                    script {
+                        String LogText = Log
+                        writeFile file: "Log.txt", text: LogText
+                    }
+
+                    emailext attachLog: true,
+                            attachmentsPattern: 'Log.txt',
+                            body: '''${SCRIPT, template="groovy-html.template"}''',
+                            recipientProviders: [[$class: 'CulpritsRecipientProvider']],
+                            subject: "Jenkins Build ${currentBuild.currentResult}: Job ${env.JOB_NAME}",
+                            mimeType: 'text/html',
+                            to: MailRecipients
+                } // always
+            } // post
+
+        } // pipiline
